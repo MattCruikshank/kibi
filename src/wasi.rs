@@ -3,10 +3,36 @@
 //! WASI-specific structs and functions. Will be imported as `sys` on WASI
 //! systems.
 
-use std::{fs::File, io};
+use std::{
+    fs::File,
+    io,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use crate::Error;
 pub use crate::xdg::*;
+
+/// METAL's terminal interface (`metal:os/terminal`): the window's size, and waiting for keys or
+/// a resize (WASI 0.2 has neither a window-size call nor `SIGWINCH`).
+#[allow(unsafe_code, clippy::all, clippy::pedantic, missing_docs, unreachable_pub, unused_qualifications)]
+mod metal {
+    wit_bindgen::generate!({
+        inline: "
+            package metal:os@0.1.0;
+            interface terminal {
+                enum event { input, resized, timeout }
+                size: func() -> option<tuple<u16, u16>>;
+                wait: func(timeout-ms: option<u32>) -> event;
+            }
+            world kibi { import terminal; }
+        ",
+    });
+}
+
+use metal::metal::os::terminal;
+
+/// The terminal said the size changed (and kibi hasn't looked yet).
+static RESIZED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Copy, Clone)]
 pub struct TermMode;
@@ -16,6 +42,9 @@ pub struct TermMode;
 /// them). Without them, return an error, so that kibi falls back to another
 /// method of getting the window size.
 pub fn get_window_size() -> Result<(usize, usize), Error> {
+    if let Some((cols, rows)) = terminal::size() {
+        return Ok((usize::from(rows), usize::from(cols)));
+    }
     let var = |name| std::env::var(name).ok()?.parse::<usize>().ok().filter(|n| *n > 0);
     match (var("LINES"), var("COLUMNS")) {
         (Some(rows), Some(cols)) => Ok((rows, cols)),
@@ -28,9 +57,29 @@ pub fn get_window_size() -> Result<(usize, usize), Error> {
 #[expect(clippy::unnecessary_wraps)] // Result required on other platforms
 pub const fn register_winsize_change_signal_handler() -> io::Result<()> { Ok(()) }
 
-/// Check if the windows size has changed since the last call to this function.
-/// On WASI platforms, this always return false.
-pub const fn has_window_size_changed() -> bool { false }
+/// Check if the windows size has changed since the last call to this function
+/// (METAL's terminal reports resizes while kibi waits for keys).
+pub fn has_window_size_changed() -> bool { RESIZED.swap(false, Ordering::Relaxed) }
+
+/// Stdin at METAL's terminal: waits for keys or a resize. A resize reads as 0
+/// bytes (kibi's input loop then checks the window size, as it does when a
+/// read times out on Unix).
+struct TerminalStdin;
+
+impl io::Read for TerminalStdin {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        loop {
+            match terminal::wait(None) {
+                terminal::Event::Input => return io::stdin().read(buf),
+                terminal::Event::Resized => {
+                    RESIZED.store(true, Ordering::Relaxed);
+                    return Ok(0);
+                }
+                terminal::Event::Timeout => {}
+            }
+        }
+    }
+}
 
 /// Set the terminal mode. On WASI platforms, this does nothing.
 #[expect(clippy::unnecessary_wraps)] // Result required on other platforms
@@ -52,7 +101,7 @@ pub const fn enable_raw_mode() -> io::Result<TermMode> { Ok(TermMode {}) }
 pub fn stdin() -> io::Result<Box<dyn io::BufRead>> {
     use std::io::IsTerminal as _;
     if io::stdin().is_terminal() {
-        return Ok(Box::new(io::stdin().lock()));
+        return Ok(Box::new(io::BufReader::new(TerminalStdin)));
     }
     Ok(Box::new(io::BufReader::new(File::open("/dev/tty")?)))
 }
