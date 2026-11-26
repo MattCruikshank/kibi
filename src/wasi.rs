@@ -11,10 +11,17 @@ pub use crate::xdg::*;
 #[derive(Copy, Clone)]
 pub struct TermMode;
 
-/// Return the current window size as (rows, columns).
-/// By returning an error we cause kibi to fall back to another method of
-/// getting the window size
-pub const fn get_window_size() -> Result<(usize, usize), Error> { Err(Error::InvalidWindowSize) }
+/// Return the current window size as (rows, columns), from the `LINES` and
+/// `COLUMNS` environment variables (WASI 0.2 has no call for it; METAL sets
+/// them). Without them, return an error, so that kibi falls back to another
+/// method of getting the window size.
+pub fn get_window_size() -> Result<(usize, usize), Error> {
+    let var = |name| std::env::var(name).ok()?.parse::<usize>().ok().filter(|n| *n > 0);
+    match (var("LINES"), var("COLUMNS")) {
+        (Some(rows), Some(cols)) => Ok((rows, cols)),
+        _ => Err(Error::InvalidWindowSize),
+    }
+}
 
 /// Register a signal handler that sets a global variable when the window size
 /// changes. On WASI platforms, this does nothing.
@@ -34,12 +41,21 @@ pub const fn set_term_mode(_term: &TermMode) -> io::Result<()> { Ok(()) }
 #[expect(clippy::unnecessary_wraps)] // Result required on other platforms
 pub const fn enable_raw_mode() -> io::Result<TermMode> { Ok(TermMode {}) }
 
-/// Construct a new handle to the standard input of the current process.
+/// Construct a new handle to the standard input of the current process: the
+/// terminal when the host gives stdin a terminal (`wasi:cli/terminal-stdin`,
+/// as METAL does), else `/dev/tty` (e.g. `wasmtime --dir /dev`).
 ///
 /// # Errors
 ///
-/// This function will return an error if /dev/tty cannot be open.
-pub fn stdin() -> io::Result<impl io::BufRead> { Ok(io::BufReader::new(File::open("/dev/tty")?)) }
+/// This function will return an error if stdin isn't a terminal and /dev/tty
+/// cannot be open.
+pub fn stdin() -> io::Result<Box<dyn io::BufRead>> {
+    use std::io::IsTerminal as _;
+    if io::stdin().is_terminal() {
+        return Ok(Box::new(io::stdin().lock()));
+    }
+    Ok(Box::new(io::BufReader::new(File::open("/dev/tty")?)))
+}
 
 pub fn path(filename: &str) -> std::path::PathBuf {
     // If the filename is absolute then it starts with a forward slash and we
